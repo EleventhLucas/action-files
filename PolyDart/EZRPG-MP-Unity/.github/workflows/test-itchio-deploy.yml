@@ -1,0 +1,46 @@
+name: Test Itch.io Deployment 🚀
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mock-build:
+    name: Mock Build 🔨
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Create Mock Build Artifact
+        run: |
+          mkdir mock_build
+          echo "This is a mock build for testing." > mock_build/mock_file.txt
+          zip -r mock_build.zip mock_build
+
+      - name: Upload Mock Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mock_build
+          path: mock_build.zip
+
+  test-deploy:
+    name: Test Deploy to Itch.io ✨
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: mock-build
+    steps:
+      - name: Download Mock Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mock_build
+
+      - name: Install Butler
+        run: |
+          curl -L -o butler.zip https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default
+          unzip butler.zip -d butler
+          sudo mv butler/butler /usr/local/bin
+
+      - name: Verify Butler Installation
+        run: butler --version
+
+      - name: Deploy to Itch.io
+        run: |
+          butler push mock_build.zip polydart/ezrpg-mp:windows
+        env:
+          BUTLER_API_KEY: ${{ secrets.ITCHIO_API_KEY }}

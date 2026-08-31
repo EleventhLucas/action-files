@@ -1,0 +1,119 @@
+name: CI/CD Pipeline to Itch.io 🚀
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  activate-unity:
+    name: Activate Unity License 🧶
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: Install CA Certificates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Unity - Activate
+        uses: game-ci/unity-activate@v2.0.0
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+
+  build:
+    name: Build Unity Project 🔨
+    # ← runs-on becomes dynamic
+    runs-on: ${{ matrix.os }}
+    needs: activate-unity
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest        # Windows host → Windows editor image
+            platform: windows
+            targetPlatform: StandaloneWindows64
+            channel: windows
+          - os: blacksmith-4vcpu-ubuntu-2404         # Linux host  → Linux editor image
+            platform: linux
+            targetPlatform: StandaloneLinux64
+            channel: linux
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Cache Unity Library
+        uses: useblacksmith/cache@v5
+        with:
+          path: Library
+          key: Library-${{ matrix.targetPlatform }}-${{ hashFiles('Assets/**','Packages/**','ProjectSettings/**') }}
+          restore-keys: |
+            Library-${{ matrix.targetPlatform }}-
+
+      - name: Build project
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_EMAIL:       ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD:    ${{ secrets.UNITY_PASSWORD }}
+          UNITY_LICENSE:     ${{ secrets.UNITY_LICENSE }}
+        with:
+          unityVersion: 6000.4.7f1
+          targetPlatform: ${{ matrix.targetPlatform }}
+          allowDirtyBuild: true
+
+      - name: Compress Build (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path build/${{ matrix.targetPlatform }}/* `
+                           -DestinationPath game_build_windows.zip
+
+      - name: Compress Build (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y zip
+          zip -r game_build_linux.zip build/${{ matrix.targetPlatform }}
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: game_build_${{ matrix.platform }}
+          path: game_build_${{ matrix.platform }}.zip
+
+  deploy:
+    name: Deploy to Itch.io ✨
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - platform: windows
+            channel: windows
+          - platform: linux
+            channel: linux
+    steps:
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: game_build_${{ matrix.platform }}
+
+      - name: Install Butler
+        run: |
+          curl -L -o butler.zip https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default
+          unzip butler.zip -d butler
+          sudo mv butler/butler /usr/local/bin
+
+      - name: Verify Butler Installation
+        run: butler --version
+
+      - name: Deploy to Itch.io
+        run: |
+          butler push game_build_${{ matrix.platform }}.zip polydart/ezrpg-mp:${{ matrix.channel }}
+        env:
+          BUTLER_API_KEY: ${{ secrets.ITCHIO_API_KEY }}

@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            package_script: package:win
+          - os: ubuntu-latest
+            package_script: package:linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run prepare:codex
+      - if: runner.os == 'Windows'
+        run: npm run test:e2e
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:e2e
+      - run: npm run ${{ matrix.package_script }} -- --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - if: runner.os == 'Windows'
+        run: |
+          $env:APPBUILDER_E2E_EXECUTABLE = (Resolve-Path "release/win-unpacked/AppBuilder.exe")
+          npx playwright test
+      - if: runner.os == 'Linux'
+        run: APPBUILDER_E2E_EXECUTABLE="$PWD/release/linux-unpacked/appbuilder" xvfb-run -a npx playwright test
+      - run: node scripts/generate-checksums.mjs release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appbuilder-${{ runner.os }}
+          path: |
+            release/*
+            !release/*-unpacked/**
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            Public beta: Windows artifacts are currently unsigned. Windows may display a SmartScreen warning.
+            Verify the adjacent SHA-256 file before running a downloaded artifact.
+          files: artifacts/*

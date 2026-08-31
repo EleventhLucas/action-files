@@ -1,0 +1,206 @@
+name: Release Desktop
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Calculate release version
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Check out repository and tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Calculate calendar version
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$GIT_REF" != "refs/heads/main" ]]; then
+            echo "Manual releases must run from the main branch." >&2
+            exit 1
+          fi
+
+          version="$(node scripts/release-version.mjs)"
+          tag="v$version"
+          node scripts/check-release-version.mjs "$tag"
+
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            sha="$WORKFLOW_SHA"
+          else
+            sha="$GITHUB_SHA"
+          fi
+
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows x64 setup and portable executables
+    needs: metadata
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build Windows installer
+        run: npm run desktop:stable
+        env:
+          DIALOGUE_CREATOR_VERSION: ${{ needs.metadata.outputs.version }}
+
+      - name: Build and validate Windows executables
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          ./scripts/package-windows-executables.ps1 -Version $env:VERSION
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64-executables
+          path: release-assets/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Linux amd64 Debian package
+    needs: metadata
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Install Linux package validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes appstream desktop-file-utils
+
+      - name: Build Debian package
+        run: npm run desktop:stable
+        env:
+          DIALOGUE_CREATOR_VERSION: ${{ needs.metadata.outputs.version }}
+
+      - name: Validate Debian package
+        shell: bash
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          package="artifacts/Dialogue-Creator_${VERSION}_linux-amd64.deb"
+          test -f "$package"
+          test "$(find artifacts -maxdepth 1 -type f | wc -l)" -eq 1
+          test "$(dpkg-deb --field "$package" Version)" = "$VERSION"
+          test "$(dpkg-deb --field "$package" Architecture)" = "amd64"
+
+          contents="$(dpkg-deb --contents "$package")"
+          grep -q './opt/dialogue-creator/bin/launcher' <<< "$contents"
+          grep -q './usr/bin/dialogue-creator' <<< "$contents"
+          grep -q './usr/share/applications/com.polydart.dialoguecreator.desktop' <<< "$contents"
+          grep -q './usr/share/icons/hicolor/512x512/apps/com.polydart.dialoguecreator.png' <<< "$contents"
+          grep -q './usr/share/metainfo/com.polydart.dialoguecreator.metainfo.xml' <<< "$contents"
+
+          package_root="$(mktemp -d)"
+          control_root="$(mktemp -d)"
+          dpkg-deb --extract "$package" "$package_root"
+          dpkg-deb --control "$package" "$control_root"
+          desktop-file-validate "$package_root/usr/share/applications/com.polydart.dialoguecreator.desktop"
+          # Ubuntu 22.04's AppStream predates --strict; validation still exits nonzero for errors.
+          appstreamcli validate --no-net "$package_root/usr/share/metainfo/com.polydart.dialoguecreator.metainfo.xml"
+          test -x "$control_root/postinst"
+          test -x "$control_root/postrm"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-amd64-deb
+          path: artifacts/Dialogue-Creator_*_linux-amd64.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Create GitHub release
+    needs: [metadata, windows, linux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum Dialogue-Creator_* > SHA256SUMS.txt
+
+      - name: Create tagged GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: ${{ needs.metadata.outputs.sha }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "Dialogue Creator $TAG" \
+            --generate-notes \
+            --latest \
+            release-assets/*

@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Install Linux package validators
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes appstream desktop-file-utils
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      - name: Build web application
+        run: npm run build
+
+      - name: Build Electrobun Debian package
+        run: npm run desktop:stable
+        env:
+          DIALOGUE_CREATOR_VERSION: 2000.1.1.1
+
+      - name: Validate Debian package
+        run: |
+          package="artifacts/Dialogue-Creator_2000.1.1.1_linux-amd64.deb"
+          test -f "$package"
+          test "$(find artifacts -maxdepth 1 -type f | wc -l)" -eq 1
+          test "$(dpkg-deb --field "$package" Version)" = "2000.1.1.1"
+          test "$(dpkg-deb --field "$package" Architecture)" = "amd64"
+
+          package_root="$(mktemp -d)"
+          control_root="$(mktemp -d)"
+          dpkg-deb --extract "$package" "$package_root"
+          dpkg-deb --control "$package" "$control_root"
+          desktop-file-validate "$package_root/usr/share/applications/com.polydart.dialoguecreator.desktop"
+          appstreamcli validate --no-net --strict "$package_root/usr/share/metainfo/com.polydart.dialoguecreator.metainfo.xml"
+          test -x "$control_root/postinst"
+          test -x "$control_root/postrm"
+
+  windows-package:
+    name: Windows setup and portable executables
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build Electrobun Windows application
+        run: npm run desktop:stable
+        env:
+          DIALOGUE_CREATOR_VERSION: 2000.1.1.1
+
+      - name: Build and validate Windows executables
+        shell: pwsh
+        run: ./scripts/package-windows-executables.ps1 -Version 2000.1.1.1
+
+      - name: Upload Windows packaging test artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x86_64-executables
+          path: release-assets/*.exe
+          if-no-files-found: error
+          retention-days: 3
